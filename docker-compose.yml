@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: antiplagiarism-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  analysis:
+    build: .
+    container_name: antiplagiarism-analysis
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: university_docs
+      DEVICE: "${DEVICE:-auto}"
+      TORCH_CPU_THREADS: "${TORCH_CPU_THREADS:-}"
+      # Задаётся через `.env` рядом с compose или export (см. env.docker.example)
+      ANALYSIS_API_KEY: "${ANALYSIS_API_KEY:-}"
+    ports:
+      - "8765:8765"
+
+volumes:
+  qdrant_storage:

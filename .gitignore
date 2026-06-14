@@ -1,0 +1,17 @@
+# Секреты модуля (локальный .env в корне)
+.env
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.DS_Store
+.pycache/
+
+# Соседние проекты в рабочей копии — не должны попадать в этот репозиторий
+/guard-main/
+/antiplagiarism/
+
+# Случайный пустой lock в родительской папке
+/package-lock.json

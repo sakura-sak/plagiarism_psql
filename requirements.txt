@@ -1,0 +1,12 @@
+torch
+transformers
+sentence-transformers
+qdrant-client
+langchain-text-splitters
+python-docx
+pypdf
+psycopg2-binary
+numpy
+urllib3
+fastapi
+uvicorn
