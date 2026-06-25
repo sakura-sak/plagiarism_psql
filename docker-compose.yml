@@ -28,6 +28,7 @@ services:
       QDRANT_COLLECTION: university_docs
       DEVICE: "${DEVICE:-cpu}"
       TORCH_CPU_THREADS: "${TORCH_CPU_THREADS:-}"
+      AI_PERCENT_BOOST: "${AI_PERCENT_BOOST:-17.5}"
       ANALYSIS_API_KEY: "${ANALYSIS_API_KEY:-}"
     ports:
       - "8765:8765"

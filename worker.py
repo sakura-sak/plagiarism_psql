@@ -80,6 +80,7 @@ class AntiPlagiarismWorker:
         self.ai_weight_p = float(os.getenv("AI_WEIGHT_P", "0.60"))
         self.ai_weight_m = float(os.getenv("AI_WEIGHT_M", "0.30"))
         self.ai_weight_c = float(os.getenv("AI_WEIGHT_C", "0.10"))
+        self.ai_percent_boost = float(os.getenv("AI_PERCENT_BOOST", "17.5"))
         self.qdrant_score_threshold = float(os.getenv("QDRANT_SCORE_THRESHOLD", "0.92"))
 
         self.encoder = SentenceTransformer(
@@ -200,9 +201,10 @@ class AntiPlagiarismWorker:
         for chunk in chunks:
             if len(chunk.strip()) > 100:
                 ai_scores.append(self._analyze_ai_chunk(chunk))
-        ai_percent = (
+        raw_ai_percent = (
             round((sum(ai_scores) / len(ai_scores)) * 100, 2) if ai_scores else 0.0
         )
+        ai_percent = round(min(100.0, max(0.0, raw_ai_percent + self.ai_percent_boost)), 2)
         vectors = self.encoder.encode(
             chunks, batch_size=16, show_progress_bar=False
         ).tolist()
