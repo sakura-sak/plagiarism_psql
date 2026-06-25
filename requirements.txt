@@ -1,12 +1,14 @@
-torch
-transformers
-sentence-transformers
-qdrant-client
-langchain-text-splitters
-python-docx
-pypdf
-psycopg2-binary
-numpy
-urllib3
-fastapi
-uvicorn
+# CPU-only PyTorch (smaller/faster install than default wheel)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+transformers==4.46.3
+sentence-transformers==3.3.1
+numpy>=1.26,<3
+qdrant-client==1.12.1
+langchain-text-splitters==0.3.4
+python-docx==1.1.2
+pypdf==5.1.0
+psycopg2-binary==2.9.10
+urllib3>=2.0,<3
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
