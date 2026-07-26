@@ -16,6 +16,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        EMBEDDING_MODEL: "${EMBEDDING_MODEL:-BAAI/bge-m3}"
+        AI_MODEL: "${AI_MODEL:-sberbank-ai/rugpt3small_based_on_gpt2}"
       cache_from:
         - antiplagiat-analysis:latest
     container_name: antiplagiarism-analysis
@@ -26,10 +29,19 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       QDRANT_COLLECTION: university_docs
-      DEVICE: "${DEVICE:-cpu}"
+      DEVICE: "${DEVICE:-auto}"
       TORCH_CPU_THREADS: "${TORCH_CPU_THREADS:-}"
-      AI_PERCENT_BOOST: "${AI_PERCENT_BOOST:-17.5}"
+      ANALYSIS_CONCURRENCY: "${ANALYSIS_CONCURRENCY:-1}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-BAAI/bge-m3}"
+      AI_MODEL: "${AI_MODEL:-sberbank-ai/rugpt3small_based_on_gpt2}"
+      QDRANT_SCORE_THRESHOLD: "${QDRANT_SCORE_THRESHOLD:-0.80}"
+      LEXICAL_SCORE_THRESHOLD: "${LEXICAL_SCORE_THRESHOLD:-0.60}"
+      PARAPHRASE_THRESHOLD: "${PARAPHRASE_THRESHOLD:-0.15}"
+      AI_DETECT_D0: "${AI_DETECT_D0:-1.0}"
+      AI_DETECT_SCALE: "${AI_DETECT_SCALE:-1.5}"
+      AI_DETECT_BATCH_SIZE: "${AI_DETECT_BATCH_SIZE:-8}"
       ANALYSIS_API_KEY: "${ANALYSIS_API_KEY:-}"
+      CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-}"
     ports:
       - "8765:8765"
 

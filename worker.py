@@ -1,16 +1,16 @@
 import base64
+import hashlib
 import io
 import math
 import os
+import re
+import threading
 import time
 import uuid
 import warnings
-import zlib
-from typing import Dict
+from collections import Counter
+from typing import Dict, List, Optional
 
-import numpy as np
-import psycopg2
-import psycopg2.extras
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
@@ -40,19 +40,55 @@ import torch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-from qdrant_client.models import Distance, PointStruct, QueryRequest, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+    QueryRequest,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Стоп-слова и каскадная классификация заимствований — в cascade.py
+# (единственный источник истины по типам exact/paraphrase/semantic).
+from cascade import (
+    DEFAULT_PARAPHRASE_THRESHOLD,
+    STOPWORDS as _STOPWORDS,
+    classify_match,
+    paraphrase_similarity,
+)
+
+
+def _term_id(token: str) -> int:
+    # Стабильный 32-битный id термина для разреженного вектора Qdrant.
+    # Встроенный hash() не годится: он меняется между запусками процесса.
+    return int.from_bytes(hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest(), "big")
+
 
 class AntiPlagiarismWorker:
+    # Имена векторов в коллекции Qdrant (гибридный поиск):
+    # dense — семантический эмбеддинг (рерайт, перефраз, межъязыковые заимствования),
+    # lexical — разреженный BM25-подобный вектор (дословное копирование, редкие
+    # термины, ФИО, номера ГОСТов) с объяснимым сигналом «совпали конкретные слова».
+    DENSE_VECTOR = "dense"
+    LEXICAL_VECTOR = "lexical"
+
     def __init__(
         self,
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         collection_name: str = "university_docs",
     ):
-        self.pg_dsn = "dbname=db user=user password=password host=host port=port"  # строка подключения к бд
+        # Единственный ML-worker разделяется между запросами (api_server → threadpool).
+        # Модель PyTorch и клиент Qdrant не рассчитаны на конкурентный доступ, поэтому
+        # тяжёлый анализ сериализуется этим локом (эффективная конкурентность = 1).
+        self._process_lock = threading.Lock()
         requested_device = os.getenv("DEVICE", "auto").strip().lower()
         if requested_device not in {"auto", "cpu", "cuda"}:
             requested_device = "auto"
@@ -72,28 +108,58 @@ class AntiPlagiarismWorker:
         if self.device == "cpu":
             torch.set_num_threads(_cpu_threads)
 
-        self.ai_rank_good = _parse_positive_int("AI_RANK_GOOD", 50)
-        self.ai_rank_bad = _parse_positive_int("AI_RANK_BAD", 1000)
-        self.ai_p_ratio_threshold = float(os.getenv("AI_P_RATIO_THRESHOLD", "0.85"))
-        self.ai_m_ratio_threshold = float(os.getenv("AI_M_RATIO_THRESHOLD", "0.01"))
-        self.ai_c_ratio_threshold = float(os.getenv("AI_C_RATIO_THRESHOLD", "0.45"))
-        self.ai_weight_p = float(os.getenv("AI_WEIGHT_P", "0.60"))
-        self.ai_weight_m = float(os.getenv("AI_WEIGHT_M", "0.30"))
-        self.ai_weight_c = float(os.getenv("AI_WEIGHT_C", "0.10"))
-        self.ai_percent_boost = float(os.getenv("AI_PERCENT_BOOST", "17.5"))
-        self.qdrant_score_threshold = float(os.getenv("QDRANT_SCORE_THRESHOLD", "0.92"))
+        # Модель эмбеддингов для семантического поиска заимствований.
+        # По умолчанию BAAI/bge-m3: мультиязычная (вкл. русский), контекст до 8192
+        # токенов, 1024 dim. Prefix-free — не требует "query:"/"passage:" (в отличие
+        # от e5-моделей). Меняется через env без правки кода.
+        self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3").strip()
+
+        # Порог косинусной близости, выше которого чанк считается заимствованным.
+        # ВНИМАНИЕ: у каждой модели своё распределение косинусов. Значение 0.80 —
+        # разумная стартовая точка для bge-m3; перекалибруйте на своих данных.
+        self.qdrant_score_threshold = float(os.getenv("QDRANT_SCORE_THRESHOLD", "0.80"))
+
+        # Порог лексического косинуса гибридного поиска. Оба вектора L2-нормированы,
+        # поэтому скор лежит в [0..1]: 1.0 — дословная копия чанка, ~0.8 — лёгкая
+        # правка, <0.3 — несвязанные тексты. Калибруется через env.
+        self.lexical_score_threshold = float(os.getenv("LEXICAL_SCORE_THRESHOLD", "0.60"))
+
+        # Порог Жаккара 3-грамм смысловых слов для тира «перефраз» каскада.
+        self.paraphrase_threshold = float(
+            os.getenv("PARAPHRASE_THRESHOLD", str(DEFAULT_PARAPHRASE_THRESHOLD))
+        )
+
+        # Детектор ИИ — Fast-DetectGPT (аналитическая sampling-free оценка).
+        # d0 — точка отсечки нормированной статистики, scale — крутизна сигмоиды.
+        # Оба калибруются на размеченной выборке через env (без пересборки образа).
+        self.ai_detect_d0 = float(os.getenv("AI_DETECT_D0", "1.0"))
+        self.ai_detect_scale = float(os.getenv("AI_DETECT_SCALE", "1.5"))
 
         self.encoder = SentenceTransformer(
-            "cointegrated/rubert-tiny2", device=self.device
+            self.embedding_model_name, device=self.device
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500, chunk_overlap=50
         )
 
-        model_name = "sberbank-ai/rugpt3small_based_on_gpt2"
+        # Scoring-модель для детектора ИИ (любая открытая causal LM). rugpt3small —
+        # компактная и бесплатная; при желании заменяется на более сильную через env.
+        model_name = os.getenv("AI_MODEL", "sberbank-ai/rugpt3small_based_on_gpt2").strip()
         self.ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # У GPT-2-подобных моделей нет pad-токена, а батчинг требует паддинга.
+        # eos безопасен: padding-позиции всё равно исключаются маской внимания.
+        if self.ai_tokenizer.pad_token is None:
+            self.ai_tokenizer.pad_token = self.ai_tokenizer.eos_token
+        # Только правый паддинг: при левом реальные токены получают сдвинутые
+        # position_ids, и logits расходятся с по-чанковым вычислением
+        # (у rugpt3 в конфиге токенизатора задан именно левый).
+        self.ai_tokenizer.padding_side = "right"
         self.ai_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
         self.ai_model.eval()
+
+        # Размер батча детектора ИИ. Ограничивает пик памяти: log-softmax по
+        # словарю (~50k) на батч из B чанков по T токенов — B×T×50k float32.
+        self.ai_detect_batch_size = _parse_positive_int("AI_DETECT_BATCH_SIZE", 8)
 
         self.qdrant = QdrantClient(
             url=f"http://{qdrant_host}:{qdrant_port}", prefer_grpc=False, timeout=30.0
@@ -109,16 +175,45 @@ class AntiPlagiarismWorker:
         """
         # Qdrant may still be booting when the analysis container starts.
         last_err: Exception | None = None
+        vector_size = int(self.encoder.get_sentence_embedding_dimension())
         for _ in range(30):
             try:
                 existing = {c.name for c in self.qdrant.get_collections().collections}
                 if self.collection_name in existing:
-                    return
+                    # Коллекция есть — проверяем совместимость схемы. Несовместимость
+                    # возможна в двух случаях: сменили EMBEDDING_MODEL (другая
+                    # размерность dense-вектора) или коллекция создана старой версией
+                    # без гибридного поиска (безымянный вектор, нет lexical). В обоих
+                    # случаях коллекцию нужно пересоздать (данные в ней будут удалены —
+                    # работы придётся переиндексировать заново).
+                    # Ошибка чтения схемы уходит в retry-цикл (внешний except),
+                    # а не трактуется как несовпадение: иначе транзиентный сбой
+                    # get_collection привёл бы к удалению живой коллекции.
+                    current_size = None
+                    info = self.qdrant.get_collection(self.collection_name)
+                    dense_cfg = info.config.params.vectors
+                    if isinstance(dense_cfg, dict):
+                        dense_params = dense_cfg.get(self.DENSE_VECTOR)
+                        current_size = dense_params.size if dense_params else None
+                    sparse_cfg = info.config.params.sparse_vectors or {}
+                    has_lexical = self.LEXICAL_VECTOR in sparse_cfg
+                    if current_size == vector_size and has_lexical:
+                        return
+                    print(
+                        f"Qdrant collection schema mismatch "
+                        f"(dense: {current_size} -> {vector_size}, lexical: {has_lexical}); "
+                        f"recreating collection."
+                    )
+                    self.qdrant.delete_collection(self.collection_name)
 
-                vector_size = int(self.encoder.get_sentence_embedding_dimension())
                 self.qdrant.create_collection(
                     collection_name=self.collection_name,
-                    vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                    vectors_config={
+                        self.DENSE_VECTOR: VectorParams(
+                            size=vector_size, distance=Distance.COSINE
+                        )
+                    },
+                    sparse_vectors_config={self.LEXICAL_VECTOR: SparseVectorParams()},
                 )
                 return
             except Exception as e:  # includes connection errors / Qdrant not ready yet
@@ -153,40 +248,111 @@ class AntiPlagiarismWorker:
                 extracted = "\n".join([p.text for p in doc.paragraphs])
                 return extracted.strip()
         except Exception as e:
-            print(f"Error parsing base64 file: {e}")
-            return "Ошибка парсинга"
+            # Пробрасываем ошибку (api_server отдаст 400): раньше здесь
+            # возвращалась строка-заглушка, которая индексировалась как текст
+            # документа — и все последующие битые файлы «совпадали» с ней на 100%.
+            raise ValueError(f"Не удалось извлечь текст из файла: {e}") from e
         return text_input
 
-    def _analyze_ai_chunk(self, text: str) -> float:
-        token_ids = self.ai_tokenizer.encode(
-            text, return_tensors="pt", max_length=1024, truncation=True
-        ).to(self.device)
-        if token_ids.shape[1] < 2:
-            return 0.0
-        with torch.no_grad():
-            logits = self.ai_model(token_ids).logits[0, :-1, :]
-            actual_next_tokens = token_ids[0, 1:].unsqueeze(-1)
-            sorted_indices = torch.argsort(logits, dim=-1, descending=True)
-            ranks = (sorted_indices == actual_next_tokens).nonzero(as_tuple=True)[
-                1
-            ].cpu().numpy() + 1
-        total_words = len(ranks)
-        if total_words == 0:
-            return 0.0
-        p_ratio = np.sum(ranks <= self.ai_rank_good) / total_words
-        p_score = 1.0 / (1.0 + math.exp(-20.0 * (p_ratio - self.ai_p_ratio_threshold)))
-        m_ratio = np.sum(ranks > self.ai_rank_bad) / total_words
-        m_score = 1.0 / (1.0 + math.exp(300.0 * (m_ratio - self.ai_m_ratio_threshold)))
-        text_bytes = text.encode("utf-8")
-        c_ratio = len(zlib.compress(text_bytes)) / len(text_bytes)
-        c_score = (
-            1.0
-            / (1.0 + math.exp(15.0 * (c_ratio - self.ai_c_ratio_threshold)))
-            * min(1.0, len(text_bytes) / 1000.0)
-        )
-        return math.sqrt(self.ai_weight_p * p_score + self.ai_weight_m * m_score + self.ai_weight_c * c_score * 100) / 100
+    def _lexical_sparse(self, text: str) -> Optional[SparseVector]:
+        """
+        Разреженный лексический вектор чанка для гибридного поиска.
 
-    def process_text(self, text: str, filename: str, verbose: bool = True) -> Dict:
+        BM25-подобное взвешивание без корпусной IDF: sublinear TF (1 + ln tf)
+        плюс отбрасывание стоп-слов, затем L2-нормировка. Скалярное произведение
+        двух таких векторов — косинус в [0..1], интерпретируемый как доля
+        лексического пересечения: 1.0 у дословной копии. Возвращает None, если
+        в чанке не осталось значимых слов (тогда работает только dense-сигнал).
+        """
+        tokens = [
+            t
+            for t in re.findall(r"[a-zа-яё0-9]+", text.lower())
+            if len(t) >= 2 and t not in _STOPWORDS
+        ]
+        if not tokens:
+            return None
+        weights: Dict[int, float] = {}
+        for token, tf in Counter(tokens).items():
+            # Коллизии 32-битного хеша на объёме словаря одного чанка пренебрежимы.
+            weights[_term_id(token)] = 1.0 + math.log(tf)
+        norm = math.sqrt(sum(w * w for w in weights.values()))
+        indices = sorted(weights)
+        return SparseVector(indices=indices, values=[weights[i] / norm for i in indices])
+
+    def _analyze_ai_chunks(self, texts: List[str]) -> List[Optional[float]]:
+        """
+        Детектор ИИ методом Fast-DetectGPT (Bao et al., 2024), аналитическая
+        sampling-free версия — без обучения, на той же открытой LM.
+
+        Идея: текст, сгенерированный ИИ, лежит в области высокой условной
+        вероятности модели. Считаем нормированную «кривизну условной вероятности»:
+
+            D = (Σ logp(x_i) − Σ μ_i) / sqrt(Σ σ²_i),
+
+        где на каждой позиции по распределению модели p(·):
+            μ_i  = Σ_v p(v)·logp(v)      — матожидание log-вероятности,
+            σ²_i = Σ_v p(v)·logp(v)² − μ² — её дисперсия.
+        Чем больше D, тем вероятнее машинная генерация.
+
+        Чанки прогоняются батчами (AI_DETECT_BATCH_SIZE) — один forward вместо
+        B последовательных. Паддинг справа до самого длинного чанка в батче;
+        padding-позиции исключены из статистики маской внимания, поэтому
+        результат совпадает с по-чанковым вычислением.
+
+        Возвращает список статистик D (float или None для слишком коротких
+        чанков) в порядке исходных текстов.
+        """
+        results: List[Optional[float]] = []
+        for start in range(0, len(texts), self.ai_detect_batch_size):
+            batch = texts[start : start + self.ai_detect_batch_size]
+            enc = self.ai_tokenizer(
+                batch,
+                return_tensors="pt",
+                max_length=1024,
+                truncation=True,
+                padding=True,
+            )
+            input_ids = enc["input_ids"].to(self.device)
+            attention_mask = enc["attention_mask"].to(self.device)
+            with torch.no_grad():
+                logits = self.ai_model(
+                    input_ids, attention_mask=attention_mask
+                ).logits[:, :-1, :]
+                log_probs = torch.log_softmax(logits, dim=-1)
+                probs = log_probs.exp()
+
+                # Матожидание и дисперсия log p по распределению модели на каждой позиции.
+                mu = (probs * log_probs).sum(dim=-1)                # E[logp]
+                second = (probs * log_probs.pow(2)).sum(dim=-1)     # E[logp²]
+                var = (second - mu.pow(2)).clamp(min=0.0)           # Var[logp] ≥ 0
+
+                actual = input_ids[:, 1:]                           # реально следующие токены
+                observed = log_probs.gather(2, actual.unsqueeze(-1)).squeeze(-1)
+
+                # Позиция учитывается, только если её целевой токен реальный
+                # (не padding); при правом паддинге префикс таких позиций
+                # всегда состоит из реальных токенов.
+                target_mask = attention_mask[:, 1:].to(log_probs.dtype)
+                for row in range(input_ids.shape[0]):
+                    mask = target_mask[row]
+                    if mask.sum().item() < 1:  # < 2 реальных токенов в чанке
+                        results.append(None)
+                        continue
+                    denom = torch.sqrt((var[row] * mask).sum()) + 1e-6
+                    d = (((observed[row] - mu[row]) * mask).sum() / denom).item()
+                    results.append(d)
+        return results
+
+    def process_text(
+        self, text: str, filename: str, verbose: bool = True, document_id: Optional[int] = None
+    ) -> Dict:
+        # Сериализуем доступ к общей ML-модели и клиенту Qdrant (см. self._process_lock).
+        with self._process_lock:
+            return self._process_text_locked(text, filename, verbose, document_id)
+
+    def _process_text_locked(
+        self, text: str, filename: str, verbose: bool = True, document_id: Optional[int] = None
+    ) -> Dict:
         actual_text = self.extract_real_text(text)
         chunks = self.text_splitter.split_text(actual_text)
         if not chunks:
@@ -194,23 +360,67 @@ class AntiPlagiarismWorker:
                 "plagiarism_percent": 0.0,
                 "ai_percent": 0.0,
                 "parsed_text": actual_text,
+                "semantic_matches": [],
             }
         if verbose:
-            print(f"Analysis {filename[:20]}... (batches: {len(chunks)})")
-        ai_scores = []
-        for chunk in chunks:
-            if len(chunk.strip()) > 100:
-                ai_scores.append(self._analyze_ai_chunk(chunk))
-        raw_ai_percent = (
-            round((sum(ai_scores) / len(ai_scores)) * 100, 2) if ai_scores else 0.0
-        )
-        ai_percent = round(min(100.0, max(0.0, raw_ai_percent + self.ai_percent_boost)), 2)
+            print(f"Analysis {filename[:20]}... (chunks: {len(chunks)})")
+        ai_texts = [chunk for chunk in chunks if len(chunk.strip()) > 100]
+        ai_stats = [d for d in self._analyze_ai_chunks(ai_texts) if d is not None]
+        if ai_stats:
+            mean_d = sum(ai_stats) / len(ai_stats)
+            # Логистическое отображение статистики Fast-DetectGPT в вероятность «ИИ».
+            ai_prob = 1.0 / (1.0 + math.exp(-self.ai_detect_scale * (mean_d - self.ai_detect_d0)))
+            ai_percent = round(ai_prob * 100, 2)
+        else:
+            ai_percent = 0.0
         vectors = self.encoder.encode(
-            chunks, batch_size=16, show_progress_bar=False
+            chunks, batch_size=16, show_progress_bar=False, normalize_embeddings=True
         ).tolist()
-        requests = [
-            QueryRequest(query=vec, limit=1, score_threshold=self.qdrant_score_threshold) for vec in vectors
-        ]
+        sparse_vectors = [self._lexical_sparse(chunk) for chunk in chunks]
+        # Исключаем из поиска чанки самого проверяемого документа: повторная
+        # проверка (пересдача, повторный клик) не должна совпадать сама с собой.
+        # Ключ — document_id; для анонимных запросов без id — filename
+        # (побочно исключит и другие документы с тем же именем).
+        if document_id is not None:
+            self_condition = FieldCondition(
+                key="document_id", match=MatchValue(value=document_id)
+            )
+        else:
+            self_condition = FieldCondition(
+                key="filename", match=MatchValue(value=filename)
+            )
+        self_exclude = Filter(must_not=[self_condition])
+        # Гибридный поиск: на каждый чанк — dense-запрос (семантика, рерайт) и
+        # lexical-запрос (дословное совпадение). Чанк считается заимствованным,
+        # если сработал хотя бы один сигнал. with_payload=True: нужен payload
+        # найденного чанка, чтобы атрибутировать совпадение к работе-источнику.
+        requests = []
+        request_map = []  # (индекс чанка, тип сигнала) для разбора батч-ответа
+        for i, vec in enumerate(vectors):
+            requests.append(
+                QueryRequest(
+                    query=vec,
+                    using=self.DENSE_VECTOR,
+                    limit=1,
+                    score_threshold=self.qdrant_score_threshold,
+                    with_payload=True,
+                    filter=self_exclude,
+                )
+            )
+            request_map.append((i, "semantic"))
+        for i, sparse in enumerate(sparse_vectors):
+            if sparse is not None:
+                requests.append(
+                    QueryRequest(
+                        query=sparse,
+                        using=self.LEXICAL_VECTOR,
+                        limit=1,
+                        score_threshold=self.lexical_score_threshold,
+                        with_payload=True,
+                        filter=self_exclude,
+                    )
+                )
+                request_map.append((i, "lexical"))
         try:
             batch_search_results = self.qdrant.query_batch_points(
                 collection_name=self.collection_name, requests=requests
@@ -224,79 +434,114 @@ class AntiPlagiarismWorker:
                 )
             else:
                 raise
+        # Топ-совпадение каждого чанка по каждому сигналу.
+        chunk_hits: List[Dict[str, object]] = [{} for _ in chunks]
+        for (chunk_idx, kind), qdrant_res in zip(request_map, batch_search_results):
+            if len(qdrant_res.points) > 0:
+                chunk_hits[chunk_idx][kind] = qdrant_res.points[0]
         plagiarized_chunks = 0
         points_to_insert = []
-        for chunk_text, vector, qdrant_res in zip(
-            chunks, vectors, batch_search_results
+        # Аггрегация совпадений по работам-источникам: dense ловит глубокий рерайт
+        # (смысл совпал, слов нет), lexical — дословное копирование; оба указывают,
+        # ИЗ КАКОЙ работы заимствовано.
+        matches_by_source: Dict[str, dict] = {}
+        for chunk_idx, (chunk_text, vector, sparse) in enumerate(
+            zip(chunks, vectors, sparse_vectors)
         ):
-            if len(qdrant_res.points) > 0:
+            hits = chunk_hits[chunk_idx]
+            if hits:
                 plagiarized_chunks += 1
+            counted_sources = set()
+            for kind, score_field in (
+                ("semantic", "max_score"),
+                ("lexical", "max_lexical_score"),
+            ):
+                top = hits.get(kind)
+                if top is None:
+                    continue
+                payload = top.payload or {}
+                src_key = str(
+                    payload.get("document_id")
+                    if payload.get("document_id") is not None
+                    else payload.get("filename") or "unknown"
+                )
+                agg = matches_by_source.setdefault(
+                    src_key,
+                    {
+                        "document_id": payload.get("document_id"),
+                        "filename": payload.get("filename"),
+                        "matched_chunks": 0,
+                        "max_score": 0.0,
+                        "max_lexical_score": 0.0,
+                        "paraphrase_score": 0.0,
+                        "sample": "",
+                    },
+                )
+                if src_key not in counted_sources:
+                    agg["matched_chunks"] += 1
+                    counted_sources.add(src_key)
+                score = float(top.score or 0.0)
+                if score > agg[score_field]:
+                    agg[score_field] = round(score, 4)
+                    if kind == "semantic" or not agg["sample"]:
+                        agg["sample"] = chunk_text[:300]
+                # Сигнал «перефраз» для каскада: пересечение смысловых 3-грамм
+                # проверяемого чанка и текста найденного чанка-источника.
+                matched_text = payload.get("text")
+                if isinstance(matched_text, str) and matched_text:
+                    p_score = paraphrase_similarity(chunk_text, matched_text)
+                    if p_score > agg["paraphrase_score"]:
+                        agg["paraphrase_score"] = round(p_score, 4)
+            point_vector: Dict[str, object] = {self.DENSE_VECTOR: vector}
+            if sparse is not None:
+                point_vector[self.LEXICAL_VECTOR] = sparse
             points_to_insert.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=vector,
-                    payload={"filename": filename, "text": chunk_text},
+                    vector=point_vector,
+                    payload={
+                        "document_id": document_id,
+                        "filename": filename,
+                        "text": chunk_text,
+                    },
                 )
             )
         if points_to_insert:
+            # Переиндексация без дубликатов: старые чанки этого документа
+            # удаляются, иначе каждый повторный анализ раздувает коллекцию.
+            # Удаляем только по document_id — по filename опасно (несколько
+            # разных документов могут разделять имя вроде "document.txt").
+            if document_id is not None:
+                self.qdrant.delete(
+                    collection_name=self.collection_name,
+                    points_selector=FilterSelector(
+                        filter=Filter(must=[self_condition])
+                    ),
+                )
             self.qdrant.upsert(
                 collection_name=self.collection_name, points=points_to_insert
             )
         plagiarism_percent = round((plagiarized_chunks / len(chunks)) * 100, 2)
+        semantic_matches: List[dict] = sorted(
+            matches_by_source.values(),
+            key=lambda m: (m["matched_chunks"], max(m["max_score"], m["max_lexical_score"])),
+            reverse=True,
+        )
+        # Каскадная классификация источников (единственный источник истины):
+        # exact → paraphrase → semantic, см. cascade.py.
+        by_type = {"exact": 0, "paraphrase": 0, "semantic": 0}
+        for match in semantic_matches:
+            match["match_type"] = classify_match(
+                match["max_lexical_score"],
+                match["paraphrase_score"],
+                self.lexical_score_threshold,
+                self.paraphrase_threshold,
+            )
+            by_type[match["match_type"]] += 1
         return {
             "plagiarism_percent": plagiarism_percent,
             "ai_percent": ai_percent,
             "parsed_text": actual_text,
+            "semantic_matches": semantic_matches,
+            "by_type": by_type,
         }
-
-    def _fetch_next_task(self):
-        try:
-            with psycopg2.connect(self.pg_dsn) as conn:
-                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-                    cursor.execute(
-                        "UPDATE tasks SET status = 'PROCESSING' WHERE id = (SELECT id FROM tasks WHERE status = 'PENDING' LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, filename, content"
-                    )
-                    row = cursor.fetchone()
-                    conn.commit()
-                    return dict(row) if row else None
-        except Exception as e:
-            print(f"Postgres error: {e}")
-            return None
-
-    def _save_task_result(self, task_id: int, result: dict):
-        try:
-            with psycopg2.connect(self.pg_dsn) as conn:
-                with conn.cursor() as cursor:
-                    if "parsed_text" in result:
-                        cursor.execute(
-                            "UPDATE tasks SET status = 'DONE', plagiarism_percent = %s, ai_percent = %s, content = %s WHERE id = %s",
-                            (
-                                result["plagiarism_percent"],
-                                result["ai_percent"],
-                                result["parsed_text"],
-                                task_id,
-                            ),
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE tasks SET status = 'DONE', plagiarism_percent = %s, ai_percent = %s WHERE id = %s",
-                            (
-                                result["plagiarism_percent"],
-                                result["ai_percent"],
-                                task_id,
-                            ),
-                        )
-                conn.commit()
-        except Exception as e:
-            print(f"Postgres error: {e}")
-
-    def run_worker_loop(self, worker_id: int):
-        print(f"worker #{worker_id} launched...")
-        while True:
-            task = self._fetch_next_task()
-            if task:
-                result = self.process_text(task["content"], task["filename"])
-                self._save_task_result(task["id"], result)
-                print(f"Processed: {task['filename'][:20]}")
-            else:
-                time.sleep(2)

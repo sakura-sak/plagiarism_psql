@@ -2,6 +2,7 @@
 .gitignore
 .venv
 venv
+qdrant-bin
 __pycache__
 *.pyc
 *.pyo
@@ -12,6 +13,4 @@ __pycache__
 *.md
 docker-compose.yml
 env.docker.example
-module.env.example.txt
-test.sql
 *.iml

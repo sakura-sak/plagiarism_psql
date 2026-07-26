@@ -3,6 +3,9 @@
 
 .venv/
 __pycache__/
+
+# Локальный бинарник Qdrant и его данные (запуск без Docker)
+qdrant-bin/
 *.py[cod]
 .pytest_cache/
 

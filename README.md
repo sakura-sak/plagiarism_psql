@@ -1,6 +1,8 @@
 # plagiarism_psql
 
-Docker-образуемый модуль анализа текста: **HTTP API** (`POST /v1/analyze`), совместимый с клиентом `guard-main` (`ANALYSIS_SERVICE_URL`), плюс опциональная очередь через PostgreSQL в `worker.py`.
+Docker-образуемый модуль анализа текста: **HTTP API** (`POST /v1/analyze`), совместимый с клиентом `guard-main` (`ANALYSIS_SERVICE_URL`).
+
+Что делает: **гибридный** поиск заимствований — семантический (эмбеддинги **BAAI/bge-m3**, ловит глубокий рерайт) плюс лексический (BM25-подобные разреженные векторы, ловит дословное копирование) в Qdrant, с атрибуцией работ-источников в `semantic_matches` — и определение ИИ-текста методом **Fast-DetectGPT** на открытой LM `rugpt3small`.
 
 Подробный контракт: [INTEGRATION.md](INTEGRATION.md).
 
