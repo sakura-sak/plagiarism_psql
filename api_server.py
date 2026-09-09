@@ -2,13 +2,14 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from job_store import get_job_store, run_queued_job
 from university_queues import DEFAULT_UNIVERSITY, UniversityQueues
 from worker import AntiPlagiarismWorker
 
@@ -27,6 +28,11 @@ class AnalyzeRequest(BaseModel):
     filename: str = Field(default="document.txt", max_length=512)
     document_id: Optional[int] = None
     university_id: str = Field(default=DEFAULT_UNIVERSITY, max_length=128)
+    category: str = Field(default="uncategorized", max_length=128)
+    # Owner username — exclude this user's other works from comparison.
+    user_id: Optional[str] = Field(default=None, max_length=128)
+    # Legacy Qdrant points may lack user_id; Guard sends sibling doc ids to exclude.
+    exclude_document_ids: list[int] = Field(default_factory=list)
 
 
 class SemanticMatch(BaseModel):
@@ -52,12 +58,46 @@ class AnalyzeResponse(BaseModel):
     by_type: dict[str, int] = {}
 
 
+class JobSubmitResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    result: Optional[AnalyzeResponse] = None
+    error: Optional[str] = None
+    document_id: Optional[int] = None
+    filename: Optional[str] = None
+
+
 def _verify_api_key(x_api_key: Optional[str]) -> None:
     expected = os.getenv("ANALYSIS_API_KEY", "").strip()
     if not expected:
         return
     if not x_api_key or x_api_key.strip() != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _require_worker() -> AntiPlagiarismWorker:
+    if _worker is None:
+        if _worker_error:
+            raise HTTPException(status_code=503, detail=f"Worker failed to start: {_worker_error}")
+        raise HTTPException(
+            status_code=503,
+            detail="Worker is still loading models. Wait and retry (first start can take 5–15 minutes on CPU).",
+        )
+    return _worker
+
+
+def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
+    return AnalyzeResponse(
+        plagiarism_percent=float(result.get("plagiarism_percent", 0.0)),
+        ai_percent=float(result.get("ai_percent", 0.0)),
+        semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
+        by_type=result.get("by_type", {}),
+    )
 
 
 async def _init_worker() -> None:
@@ -98,7 +138,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Antiplagiarism Analysis API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -124,31 +164,90 @@ async def health():
 
 @app.post("/v1/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    """Синхронный анализ (совместимость). Предпочтительно POST /v1/jobs + poll."""
     _verify_api_key(x_api_key)
-    if _worker is None:
-        if _worker_error:
-            raise HTTPException(status_code=503, detail=f"Worker failed to start: {_worker_error}")
-        raise HTTPException(
-            status_code=503,
-            detail="Worker is still loading models. Wait and retry (first start can take 5–15 minutes on CPU).",
-        )
+    worker = _require_worker()
 
-    worker = _worker
     try:
-        # Задача встаёт в очередь своего университета; планировщик обходит
-        # очереди по кругу, чтобы ни один университет не блокировал остальные.
         result = await _queues.submit(
             body.university_id,
-            lambda: worker.process_text(body.content, body.filename, False, body.document_id),
+            lambda: worker.process_text(
+                body.content,
+                body.filename,
+                False,
+                body.document_id,
+                category=body.category,
+                institution_id=body.university_id,
+                user_id=body.user_id,
+                exclude_document_ids=body.exclude_document_ids,
+            ),
         )
     except ValueError as exc:
-        # Некорректный входной файл (битый base64/PDF/DOCX) — ошибка клиента.
         raise HTTPException(status_code=400, detail=str(exc))
-    return AnalyzeResponse(
-        plagiarism_percent=float(result.get("plagiarism_percent", 0.0)),
-        ai_percent=float(result.get("ai_percent", 0.0)),
-        semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
-        by_type=result.get("by_type", {}),
+    return _to_analyze_response(result)
+
+
+@app.post("/v1/jobs", response_model=JobSubmitResponse, status_code=202)
+async def submit_job(body: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    """
+    Поставить анализ в очередь и сразу вернуть job_id.
+    Клиент опрашивает GET /v1/jobs/{job_id} — соединение не держится минутами.
+    """
+    _verify_api_key(x_api_key)
+    worker = _require_worker()
+    store = get_job_store()
+
+    rec = await store.create(body.university_id, body.document_id, body.filename)
+    content = body.content
+    filename = body.filename
+    document_id = body.document_id
+    university_id = body.university_id
+    category = body.category
+    user_id = body.user_id
+    exclude_document_ids = list(body.exclude_document_ids or [])
+    job_id = rec.job_id
+
+    def _submit():
+        return _queues.submit(
+            university_id,
+            lambda: worker.process_text(
+                content,
+                filename,
+                False,
+                document_id,
+                category=category,
+                institution_id=university_id,
+                user_id=user_id,
+                exclude_document_ids=exclude_document_ids,
+            ),
+        )
+
+    asyncio.create_task(run_queued_job(job_id, _submit))
+
+    return JobSubmitResponse(job_id=job_id, status="queued")
+
+
+@app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(job_id: str, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    _verify_api_key(x_api_key)
+    rec = await get_job_store().get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = None
+    if rec.status == "completed" and rec.result is not None:
+        try:
+            result = _to_analyze_response(rec.result)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Invalid stored result: {exc}")
+
+    return JobStatusResponse(
+        job_id=rec.job_id,
+        status=rec.status,
+        result=result,
+        error=rec.error,
+        document_id=rec.document_id,
+        filename=rec.filename,
     )
 
 
@@ -156,4 +255,7 @@ async def analyze(body: AnalyzeRequest, x_api_key: Optional[str] = Header(defaul
 async def queues(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
     """Состояние очередей анализа по университетам."""
     _verify_api_key(x_api_key)
-    return _queues.stats()
+    return {
+        "queues": _queues.stats(),
+        "jobs": get_job_store().stats(),
+    }

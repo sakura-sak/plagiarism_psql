@@ -1,16 +1,12 @@
+# Build context hygiene — keep `docker compose build analysis` small/fast.
 .git
-.gitignore
-.venv
-venv
-qdrant-bin
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache
-*.log
 .idea
+__pycache__
+*.py[cod]
 *.md
+.env
+.env.*
 docker-compose.yml
 env.docker.example
-*.iml
+INTEGRATION.md
+README.md

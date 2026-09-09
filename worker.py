@@ -46,6 +46,7 @@ from qdrant_client.models import (
     Filter,
     FilterSelector,
     MatchValue,
+    MatchAny,
     PointStruct,
     QueryRequest,
     SparseVector,
@@ -57,6 +58,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
+from comparison_scope import comparison_categories, normalize_category_slug
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
@@ -343,16 +345,101 @@ class AntiPlagiarismWorker:
                     results.append(d)
         return results
 
+    def _build_comparison_filter(
+        self,
+        document_id: Optional[int],
+        filename: str,
+        category: str,
+        institution_id: Optional[str],
+        user_id: Optional[str] = None,
+        exclude_document_ids: Optional[List[int]] = None,
+    ) -> Filter:
+        """
+        Сравниваем только с чужими работами того же вуза/типа.
+        Исключаем: текущий документ, все документы того же user_id,
+        и явный список exclude_document_ids (для старых точек без user_id в payload).
+        """
+        must_not: List[FieldCondition] = []
+        if document_id is not None:
+            must_not.append(
+                FieldCondition(key="document_id", match=MatchValue(value=document_id))
+            )
+        else:
+            must_not.append(
+                FieldCondition(key="filename", match=MatchValue(value=filename))
+            )
+
+        uid = (user_id or "").strip()
+        if uid:
+            must_not.append(
+                FieldCondition(key="user_id", match=MatchValue(value=uid))
+            )
+
+        extra_ids = [
+            int(x)
+            for x in (exclude_document_ids or [])
+            if isinstance(x, (int, float)) and int(x) > 0 and int(x) != document_id
+        ]
+        # Unique, capped — Qdrant MatchAny on huge lists is costly
+        extra_ids = sorted(set(extra_ids))[:500]
+        if extra_ids:
+            must_not.append(
+                FieldCondition(key="document_id", match=MatchAny(any=extra_ids))
+            )
+
+        must: List[FieldCondition] = []
+        inst = (institution_id or "").strip()
+        if inst:
+            must.append(
+                FieldCondition(key="institution_id", match=MatchValue(value=inst))
+            )
+
+        pool = comparison_categories(category)
+        if len(pool) == 1:
+            must.append(FieldCondition(key="category", match=MatchValue(value=pool[0])))
+        else:
+            must.append(FieldCondition(key="category", match=MatchAny(any=pool)))
+
+        return Filter(must=must, must_not=must_not)
+
     def process_text(
-        self, text: str, filename: str, verbose: bool = True, document_id: Optional[int] = None
+        self,
+        text: str,
+        filename: str,
+        verbose: bool = True,
+        document_id: Optional[int] = None,
+        category: Optional[str] = None,
+        institution_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        exclude_document_ids: Optional[List[int]] = None,
     ) -> Dict:
         # Сериализуем доступ к общей ML-модели и клиенту Qdrant (см. self._process_lock).
         with self._process_lock:
-            return self._process_text_locked(text, filename, verbose, document_id)
+            return self._process_text_locked(
+                text,
+                filename,
+                verbose,
+                document_id,
+                category,
+                institution_id,
+                user_id,
+                exclude_document_ids,
+            )
 
     def _process_text_locked(
-        self, text: str, filename: str, verbose: bool = True, document_id: Optional[int] = None
+        self,
+        text: str,
+        filename: str,
+        verbose: bool = True,
+        document_id: Optional[int] = None,
+        category: Optional[str] = None,
+        institution_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        exclude_document_ids: Optional[List[int]] = None,
     ) -> Dict:
+        norm_category = normalize_category_slug(category or "uncategorized")
+        norm_institution = (institution_id or "").strip() or None
+        norm_user_id = (user_id or "").strip() or None
         actual_text = self.extract_real_text(text)
         chunks = self.text_splitter.split_text(actual_text)
         if not chunks:
@@ -377,10 +464,14 @@ class AntiPlagiarismWorker:
             chunks, batch_size=16, show_progress_bar=False, normalize_embeddings=True
         ).tolist()
         sparse_vectors = [self._lexical_sparse(chunk) for chunk in chunks]
-        # Исключаем из поиска чанки самого проверяемого документа: повторная
-        # проверка (пересдача, повторный клик) не должна совпадать сама с собой.
-        # Ключ — document_id; для анонимных запросов без id — filename
-        # (побочно исключит и другие документы с тем же именем).
+        search_filter = self._build_comparison_filter(
+            document_id,
+            filename,
+            norm_category,
+            norm_institution,
+            user_id=norm_user_id,
+            exclude_document_ids=exclude_document_ids,
+        )
         if document_id is not None:
             self_condition = FieldCondition(
                 key="document_id", match=MatchValue(value=document_id)
@@ -389,7 +480,6 @@ class AntiPlagiarismWorker:
             self_condition = FieldCondition(
                 key="filename", match=MatchValue(value=filename)
             )
-        self_exclude = Filter(must_not=[self_condition])
         # Гибридный поиск: на каждый чанк — dense-запрос (семантика, рерайт) и
         # lexical-запрос (дословное совпадение). Чанк считается заимствованным,
         # если сработал хотя бы один сигнал. with_payload=True: нужен payload
@@ -404,7 +494,7 @@ class AntiPlagiarismWorker:
                     limit=1,
                     score_threshold=self.qdrant_score_threshold,
                     with_payload=True,
-                    filter=self_exclude,
+                    filter=search_filter,
                 )
             )
             request_map.append((i, "semantic"))
@@ -417,7 +507,7 @@ class AntiPlagiarismWorker:
                         limit=1,
                         score_threshold=self.lexical_score_threshold,
                         with_payload=True,
-                        filter=self_exclude,
+                        filter=search_filter,
                     )
                 )
                 request_map.append((i, "lexical"))
@@ -503,6 +593,9 @@ class AntiPlagiarismWorker:
                         "document_id": document_id,
                         "filename": filename,
                         "text": chunk_text,
+                        "category": norm_category,
+                        "institution_id": norm_institution,
+                        "user_id": norm_user_id,
                     },
                 )
             )
