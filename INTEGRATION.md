@@ -84,9 +84,16 @@ This module exposes HTTP API compatible with `guard-main/lib/analysis-client.ts`
 - `QDRANT_SCORE_THRESHOLD` (default: `0.80`) — порог косинуса эмбеддингов (семантический сигнал)
 - `LEXICAL_SCORE_THRESHOLD` (default: `0.60`) — порог лексического косинуса (дословное копирование)
 - `PARAPHRASE_THRESHOLD` (default: `0.15`) — порог Жаккара смысловых 3-грамм для тира «перефраз» каскада
+- `AI_ENABLED` (default: `true`) — `false` не грузит языковую модель и отдаёт `ai_percent = 0`
 - `AI_DETECT_BATCH_SIZE` (default: `8`) — размер батча детектора ИИ (больше — быстрее, но выше пик памяти)
-- `AI_DETECT_D0` (default: `1.0`), `AI_DETECT_SCALE` (default: `1.5`) — калибровка детектора ИИ
-- `EMBEDDING_MODEL` (default: `BAAI/bge-m3`), `AI_MODEL` (default: `sberbank-ai/rugpt3small_based_on_gpt2`) — замена моделей без правки кода
+- `AI_DETECT_D0` (default: `1.0`), `AI_DETECT_SCALE` (default: `1.5`) — калибровка сигмоиды
+- `AI_CHUNK_SIZE` / `AI_CHUNK_OVERLAP` (default: `500` / `50`) — окно детектора, отдельно от поиска
+- `AI_MIN_CHUNK_CHARS` (default: `100`) — окна этой длины и короче пропускаются
+- `AI_MAX_TOKENS` (default: `1024`) — обрезка окна
+- `AI_AGGREGATION` (default: `mean`) — `mean` | `median` | `max` | `top_share`
+- `AI_TOP_SHARE_THRESHOLD` (default: `AI_DETECT_D0`) — порог для `top_share`
+- `AI_DEBUG_LOG` / `AI_DEBUG_LOG_CHUNKS` (default: `false`) — сводка и окна в stdout
+- `EMBEDDING_MODEL` (default: `BAAI/bge-m3`), `AI_MODEL` (default: `sberbank-ai/rugpt3small_based_on_gpt2`) — замена моделей; `AI_MODEL` требует пересборки образа, остальные `AI_*` — только перезапуск
 - `CORS_ALLOW_ORIGINS` (optional) — список origin через запятую для браузерных запросов напрямую к API
 - `TORCH_CPU_THREADS` (optional) — OpenMP/torch CPU threads on CPU runs (default: up to 8 or available cores)
 

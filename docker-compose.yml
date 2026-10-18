@@ -2,7 +2,7 @@
 
 services:
   qdrant:
-    image: qdrant/qdrant:v1.12.5
+    image: qdrant/qdrant:v1.17.1
     container_name: antiplagiarism-qdrant
     restart: unless-stopped
     ports:
@@ -34,12 +34,27 @@ services:
       QDRANT_SCORE_THRESHOLD: "${QDRANT_SCORE_THRESHOLD:-0.80}"
       LEXICAL_SCORE_THRESHOLD: "${LEXICAL_SCORE_THRESHOLD:-0.60}"
       PARAPHRASE_THRESHOLD: "${PARAPHRASE_THRESHOLD:-0.15}"
-      AI_DETECT_D0: "${AI_DETECT_D0:-1.0}"
-      AI_DETECT_SCALE: "${AI_DETECT_SCALE:-1.5}"
+      AI_DETECT_D0: "${AI_DETECT_D0:--2.2}"
+      AI_DETECT_SCALE: "${AI_DETECT_SCALE:-3}"
       AI_DETECT_BATCH_SIZE: "${AI_DETECT_BATCH_SIZE:-8}"
+      AI_ENABLED: "${AI_ENABLED:-true}"
+      AI_CHUNK_SIZE: "${AI_CHUNK_SIZE:-1000}"
+      AI_CHUNK_OVERLAP: "${AI_CHUNK_OVERLAP:-100}"
+      AI_MIN_CHUNK_CHARS: "${AI_MIN_CHUNK_CHARS:-100}"
+      AI_MAX_TOKENS: "${AI_MAX_TOKENS:-1500}"
+      AI_AGGREGATION: "${AI_AGGREGATION:-mean}"
+      AI_TOP_SHARE_THRESHOLD: "${AI_TOP_SHARE_THRESHOLD:-}"
+      AI_DEBUG_LOG: "${AI_DEBUG_LOG:-true}"
+      AI_DEBUG_LOG_CHUNKS: "${AI_DEBUG_LOG_CHUNKS:-false}"
       ANALYSIS_API_KEY: "${ANALYSIS_API_KEY:-}"
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-}"
       HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_HOME: /opt/models/huggingface
+      HF_HUB_CACHE: /opt/models/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /opt/models/sentence-transformers
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
     ports:
       - "8765:8765"
     healthcheck:

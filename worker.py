@@ -58,6 +58,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
+from ai_scoring import ai_percent_from_scores, format_startup_line, load_ai_config, score_stats
 from comparison_scope import comparison_categories, normalize_category_slug
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
@@ -131,11 +132,14 @@ class AntiPlagiarismWorker:
             os.getenv("PARAPHRASE_THRESHOLD", str(DEFAULT_PARAPHRASE_THRESHOLD))
         )
 
-        # Детектор ИИ — Fast-DetectGPT (аналитическая sampling-free оценка).
-        # d0 — точка отсечки нормированной статистики, scale — крутизна сигмоиды.
-        # Оба калибруются на размеченной выборке через env (без пересборки образа).
-        self.ai_detect_d0 = float(os.getenv("AI_DETECT_D0", "1.0"))
-        self.ai_detect_scale = float(os.getenv("AI_DETECT_SCALE", "1.5"))
+        # Детектор ИИ — Fast-DetectGPT. Все пороги, окно и агрегация — из env
+        # (ai_scoring.load_ai_config). Поиск заимствований ниже остаётся на 500/50.
+        self.ai_config = load_ai_config()
+        self.ai_detect_d0 = self.ai_config.d0
+        self.ai_detect_scale = self.ai_config.scale
+        self.ai_detect_batch_size = self.ai_config.batch_size
+        if self.ai_config.debug_log:
+            print(format_startup_line(self.ai_config), flush=True)
 
         self.encoder = SentenceTransformer(
             self.embedding_model_name, device=self.device
@@ -143,25 +147,29 @@ class AntiPlagiarismWorker:
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500, chunk_overlap=50
         )
+        self.ai_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.ai_config.chunk_size,
+            chunk_overlap=self.ai_config.chunk_overlap,
+        )
 
         # Scoring-модель для детектора ИИ (любая открытая causal LM). rugpt3small —
         # компактная и бесплатная; при желании заменяется на более сильную через env.
-        model_name = os.getenv("AI_MODEL", "sberbank-ai/rugpt3small_based_on_gpt2").strip()
-        self.ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # У GPT-2-подобных моделей нет pad-токена, а батчинг требует паддинга.
-        # eos безопасен: padding-позиции всё равно исключаются маской внимания.
-        if self.ai_tokenizer.pad_token is None:
-            self.ai_tokenizer.pad_token = self.ai_tokenizer.eos_token
-        # Только правый паддинг: при левом реальные токены получают сдвинутые
-        # position_ids, и logits расходятся с по-чанковым вычислением
-        # (у rugpt3 в конфиге токенизатора задан именно левый).
-        self.ai_tokenizer.padding_side = "right"
-        self.ai_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
-        self.ai_model.eval()
-
-        # Размер батча детектора ИИ. Ограничивает пик памяти: log-softmax по
-        # словарю (~50k) на батч из B чанков по T токенов — B×T×50k float32.
-        self.ai_detect_batch_size = _parse_positive_int("AI_DETECT_BATCH_SIZE", 8)
+        # AI_ENABLED=false не грузит модель: процент ИИ тогда всегда 0.
+        self.ai_tokenizer = None
+        self.ai_model = None
+        if self.ai_config.enabled:
+            model_name = self.ai_config.model
+            self.ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            # У GPT-2-подобных моделей нет pad-токена, а батчинг требует паддинга.
+            # eos безопасен: padding-позиции всё равно исключаются маской внимания.
+            if self.ai_tokenizer.pad_token is None:
+                self.ai_tokenizer.pad_token = self.ai_tokenizer.eos_token
+            # Только правый паддинг: при левом реальные токены получают сдвинутые
+            # position_ids, и logits расходятся с по-чанковым вычислением
+            # (у rugpt3 в конфиге токенизатора задан именно левый).
+            self.ai_tokenizer.padding_side = "right"
+            self.ai_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
+            self.ai_model.eval()
 
         self.qdrant = QdrantClient(
             url=f"http://{qdrant_host}:{qdrant_port}", prefer_grpc=False, timeout=30.0
@@ -281,6 +289,36 @@ class AntiPlagiarismWorker:
         indices = sorted(weights)
         return SparseVector(indices=indices, values=[weights[i] / norm for i in indices])
 
+    def _log_ai(
+        self,
+        document_id: Optional[int],
+        filename: str,
+        windows_total: int,
+        pairs: List[tuple],
+        ai_percent: float,
+    ) -> None:
+        if not self.ai_config.debug_log:
+            return
+        stats = score_stats([score for _, score in pairs])
+
+        def fmt(value: Optional[float]) -> str:
+            return "n/a" if value is None else f"{value:.4f}"
+
+        print(
+            "AI debug: "
+            f"document_id={document_id} file={filename!r} model={self.ai_config.model} "
+            f"windows={windows_total} scored={len(pairs)} "
+            f"mean={fmt(stats['mean'])} median={fmt(stats['median'])} "
+            f"min={fmt(stats['min'])} max={fmt(stats['max'])} "
+            f"aggregation={self.ai_config.aggregation} ai_percent={ai_percent}",
+            flush=True,
+        )
+        if not self.ai_config.debug_chunks:
+            return
+        for chunk, score in pairs:
+            preview = " ".join(chunk.split())[:80]
+            print(f"AI debug chunk: D={score:.4f} {preview}", flush=True)
+
     def _analyze_ai_chunks(self, texts: List[str]) -> List[Optional[float]]:
         """
         Детектор ИИ методом Fast-DetectGPT (Bao et al., 2024), аналитическая
@@ -310,7 +348,7 @@ class AntiPlagiarismWorker:
             enc = self.ai_tokenizer(
                 batch,
                 return_tensors="pt",
-                max_length=1024,
+                max_length=self.ai_config.max_tokens,
                 truncation=True,
                 padding=True,
             )
@@ -395,7 +433,11 @@ class AntiPlagiarismWorker:
             )
 
         pool = comparison_categories(category)
-        if len(pool) == 1:
+        # None: SEO work, compare with every category of this institution.
+        # Site categories never include "seo", so those works stay out of the site pool.
+        if pool is None:
+            pass
+        elif len(pool) == 1:
             must.append(FieldCondition(key="category", match=MatchValue(value=pool[0])))
         else:
             must.append(FieldCondition(key="category", match=MatchAny(any=pool)))
@@ -451,15 +493,20 @@ class AntiPlagiarismWorker:
             }
         if verbose:
             print(f"Analysis {filename[:20]}... (chunks: {len(chunks)})")
-        ai_texts = [chunk for chunk in chunks if len(chunk.strip()) > 100]
-        ai_stats = [d for d in self._analyze_ai_chunks(ai_texts) if d is not None]
-        if ai_stats:
-            mean_d = sum(ai_stats) / len(ai_stats)
-            # Логистическое отображение статистики Fast-DetectGPT в вероятность «ИИ».
-            ai_prob = 1.0 / (1.0 + math.exp(-self.ai_detect_scale * (mean_d - self.ai_detect_d0)))
-            ai_percent = round(ai_prob * 100, 2)
-        else:
-            ai_percent = 0.0
+        ai_windows = self.ai_splitter.split_text(actual_text) if self.ai_config.enabled else []
+        ai_texts = [
+            chunk
+            for chunk in ai_windows
+            if len(chunk.strip()) > self.ai_config.min_chunk_chars
+        ]
+        ai_pairs = []
+        if ai_texts and self.ai_model is not None:
+            for chunk, score in zip(ai_texts, self._analyze_ai_chunks(ai_texts)):
+                if score is not None:
+                    ai_pairs.append((chunk, score))
+        ai_stats = [score for _, score in ai_pairs]
+        ai_percent = ai_percent_from_scores(ai_stats, self.ai_config) if self.ai_config.enabled else 0.0
+        self._log_ai(document_id, filename, len(ai_windows), ai_pairs, ai_percent)
         vectors = self.encoder.encode(
             chunks, batch_size=16, show_progress_bar=False, normalize_embeddings=True
         ).tolist()

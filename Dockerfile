@@ -12,6 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TOKENIZERS_PARALLELISM=false \
     HF_HOME=/opt/models/huggingface \
+    HF_HUB_CACHE=/opt/models/huggingface \
     SENTENCE_TRANSFORMERS_HOME=/opt/models/sentence-transformers \
     TORCH_HOME=/opt/models/torch \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
@@ -43,7 +44,7 @@ RUN --mount=type=cache,id=analysis-hf,target=/cache/hf \
  && cp -a /cache/st/. /opt/models/sentence-transformers/
 
 # Layer 3 — application code (changes often; cheap rebuild)
-COPY api_server.py worker.py cascade.py university_queues.py job_store.py comparison_scope.py ./
+COPY api_server.py worker.py cascade.py ai_scoring.py university_queues.py job_store.py comparison_scope.py ./
 
 EXPOSE 8765
 
