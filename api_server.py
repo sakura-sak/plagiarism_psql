@@ -4,7 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -35,6 +35,14 @@ class AnalyzeRequest(BaseModel):
     exclude_document_ids: list[int] = Field(default_factory=list)
 
 
+class MatchFragment(BaseModel):
+    """Один совпавший фрагмент: кусок проверяемой работы и кусок источника."""
+    query_text: str = ""
+    source_text: str = ""
+    score: float = 0.0
+    match_type: str = "semantic"
+
+
 class SemanticMatch(BaseModel):
     """Совпадение с работой-источником: семантическое (глубокий рерайт, max_score)
     и/или лексическое (дословное копирование, max_lexical_score).
@@ -49,11 +57,19 @@ class SemanticMatch(BaseModel):
     paraphrase_score: float = 0.0
     match_type: str = "semantic"
     sample: str = ""
+    fragments: list[MatchFragment] = []
+
+
+class AiFragment(BaseModel):
+    text: str = ""
+    d_score: float = 0.0
+    ai_probability: float = 0.0
 
 
 class AnalyzeResponse(BaseModel):
     plagiarism_percent: float
-    ai_percent: float
+    ai_percent: Optional[float] = None
+    ai_fragments: list[AiFragment] = []
     semantic_matches: list[SemanticMatch] = []
     by_type: dict[str, int] = {}
 
@@ -92,9 +108,11 @@ def _require_worker() -> AntiPlagiarismWorker:
 
 
 def _to_analyze_response(result: dict[str, Any]) -> AnalyzeResponse:
+    raw_ai = result.get("ai_percent")
     return AnalyzeResponse(
         plagiarism_percent=float(result.get("plagiarism_percent", 0.0)),
-        ai_percent=float(result.get("ai_percent", 0.0)),
+        ai_percent=None if raw_ai is None else float(raw_ai),
+        ai_fragments=[AiFragment(**f) for f in result.get("ai_fragments", [])],
         semantic_matches=[SemanticMatch(**m) for m in result.get("semantic_matches", [])],
         by_type=result.get("by_type", {}),
     )
@@ -249,6 +267,23 @@ async def get_job(job_id: str, x_api_key: Optional[str] = Header(default=None, a
         document_id=rec.document_id,
         filename=rec.filename,
     )
+
+
+@app.delete("/v1/documents/{document_id}", status_code=204)
+async def delete_document(
+    document_id: int,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    """Удаляет векторы документа из Qdrant. Вызывается, когда Guard удаляет работу."""
+    _verify_api_key(x_api_key)
+    if document_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid document id")
+    worker = _require_worker()
+    try:
+        await run_in_threadpool(worker.delete_document_points, document_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Qdrant delete failed: {exc}")
+    return Response(status_code=204)
 
 
 @app.get("/v1/queues")

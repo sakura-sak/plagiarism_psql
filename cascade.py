@@ -87,3 +87,48 @@ def classify_match(
     if paraphrase_score >= paraphrase_threshold:
         return PARAPHRASE
     return SEMANTIC
+
+
+MAX_FRAGMENTS_PER_SOURCE = 20
+FRAGMENT_TEXT_LIMIT = 400
+
+
+def classify_fragment(
+    kind: str,
+    score: float,
+    query_text: str,
+    source_text: str,
+    lexical_threshold: float,
+    paraphrase_threshold: float = DEFAULT_PARAPHRASE_THRESHOLD,
+) -> str:
+    """Тип одного фрагмента: лексический сигнал выше порога — дословно, иначе перефраз или смысл."""
+    if kind == "lexical" and score >= lexical_threshold:
+        return EXACT
+    if paraphrase_similarity(query_text, source_text) >= paraphrase_threshold:
+        return PARAPHRASE
+    return SEMANTIC
+
+
+def make_fragment(
+    query_text: str,
+    source_text: str,
+    score: float,
+    kind: str,
+    lexical_threshold: float,
+    paraphrase_threshold: float = DEFAULT_PARAPHRASE_THRESHOLD,
+) -> dict:
+    query = (query_text or "")[:FRAGMENT_TEXT_LIMIT]
+    source = (source_text or "")[:FRAGMENT_TEXT_LIMIT]
+    return {
+        "query_text": query,
+        "source_text": source,
+        "score": round(float(score or 0.0), 4),
+        "match_type": classify_fragment(
+            kind, float(score or 0.0), query, source, lexical_threshold, paraphrase_threshold
+        ),
+    }
+
+
+def append_fragment(fragments: list, fragment: dict, limit: int = MAX_FRAGMENTS_PER_SOURCE) -> None:
+    if len(fragments) < limit:
+        fragments.append(fragment)

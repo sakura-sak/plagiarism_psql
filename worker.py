@@ -58,12 +58,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Стоп-слова и каскадная классификация заимствований — в cascade.py
 # (единственный источник истины по типам exact/paraphrase/semantic).
-from ai_scoring import ai_percent_from_scores, format_startup_line, load_ai_config, score_stats
+from ai_result import build_ai_fragments, resolve_ai_percent
+from ai_scoring import format_startup_line, load_ai_config, score_stats
+from text_normalize import normalize_text
 from comparison_scope import comparison_categories, normalize_category_slug
 from cascade import (
     DEFAULT_PARAPHRASE_THRESHOLD,
     STOPWORDS as _STOPWORDS,
+    append_fragment,
     classify_match,
+    make_fragment,
     paraphrase_similarity,
 )
 
@@ -154,7 +158,7 @@ class AntiPlagiarismWorker:
 
         # Scoring-модель для детектора ИИ (любая открытая causal LM). rugpt3small —
         # компактная и бесплатная; при желании заменяется на более сильную через env.
-        # AI_ENABLED=false не грузит модель: процент ИИ тогда всегда 0.
+        # AI_ENABLED=false не грузит модель: сигнала нет, ai_percent = null.
         self.ai_tokenizer = None
         self.ai_model = None
         if self.ai_config.enabled:
@@ -295,7 +299,7 @@ class AntiPlagiarismWorker:
         filename: str,
         windows_total: int,
         pairs: List[tuple],
-        ai_percent: float,
+        ai_percent: Optional[float],
     ) -> None:
         if not self.ai_config.debug_log:
             return
@@ -482,12 +486,13 @@ class AntiPlagiarismWorker:
         norm_category = normalize_category_slug(category or "uncategorized")
         norm_institution = (institution_id or "").strip() or None
         norm_user_id = (user_id or "").strip() or None
-        actual_text = self.extract_real_text(text)
+        actual_text = normalize_text(self.extract_real_text(text))
         chunks = self.text_splitter.split_text(actual_text)
         if not chunks:
             return {
                 "plagiarism_percent": 0.0,
-                "ai_percent": 0.0,
+                "ai_percent": None,
+                "ai_fragments": [],
                 "parsed_text": actual_text,
                 "semantic_matches": [],
             }
@@ -505,7 +510,16 @@ class AntiPlagiarismWorker:
                 if score is not None:
                     ai_pairs.append((chunk, score))
         ai_stats = [score for _, score in ai_pairs]
-        ai_percent = ai_percent_from_scores(ai_stats, self.ai_config) if self.ai_config.enabled else 0.0
+        ai_percent = resolve_ai_percent(
+            enabled=self.ai_config.enabled,
+            scores=ai_stats,
+            config=self.ai_config,
+        )
+        ai_fragments = build_ai_fragments(
+            ai_pairs,
+            self.ai_config,
+            max_fragments=getattr(self, "report_max_fragments", 50),
+        )
         self._log_ai(document_id, filename, len(ai_windows), ai_pairs, ai_percent)
         vectors = self.encoder.encode(
             chunks, batch_size=16, show_progress_bar=False, normalize_embeddings=True
@@ -612,20 +626,33 @@ class AntiPlagiarismWorker:
                         "max_lexical_score": 0.0,
                         "paraphrase_score": 0.0,
                         "sample": "",
+                        "fragments": [],
                     },
                 )
                 if src_key not in counted_sources:
                     agg["matched_chunks"] += 1
                     counted_sources.add(src_key)
                 score = float(top.score or 0.0)
+                matched_text = payload.get("text")
+                source_text = matched_text if isinstance(matched_text, str) else ""
                 if score > agg[score_field]:
                     agg[score_field] = round(score, 4)
                     if kind == "semantic" or not agg["sample"]:
                         agg["sample"] = chunk_text[:300]
+                append_fragment(
+                    agg["fragments"],
+                    make_fragment(
+                        chunk_text,
+                        source_text,
+                        score,
+                        kind,
+                        self.lexical_score_threshold,
+                        self.paraphrase_threshold,
+                    ),
+                )
                 # Сигнал «перефраз» для каскада: пересечение смысловых 3-грамм
                 # проверяемого чанка и текста найденного чанка-источника.
-                matched_text = payload.get("text")
-                if isinstance(matched_text, str) and matched_text:
+                if source_text:
                     p_score = paraphrase_similarity(chunk_text, matched_text)
                     if p_score > agg["paraphrase_score"]:
                         agg["paraphrase_score"] = round(p_score, 4)
@@ -681,7 +708,24 @@ class AntiPlagiarismWorker:
         return {
             "plagiarism_percent": plagiarism_percent,
             "ai_percent": ai_percent,
+            "ai_fragments": ai_fragments,
             "parsed_text": actual_text,
             "semantic_matches": semantic_matches,
             "by_type": by_type,
         }
+
+    def delete_document_points(self, document_id: int) -> None:
+        """Удаляет чанки документа из Qdrant. Нет точек — тоже успех."""
+        self.qdrant.delete(
+            collection_name=self.collection_name,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=int(document_id)),
+                        )
+                    ]
+                )
+            ),
+        )
